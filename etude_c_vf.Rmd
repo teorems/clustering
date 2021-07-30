@@ -1,0 +1,469 @@
+---
+title: "La poule qui chante, étude de marché"
+subtitle: "Utilisation des techniques de l'analyse des composantes principales, du clustering ascendant hierarchique,  des Kmeans et du DBSCAN pour génerer une segmentation de potentiels clients."
+author: "Emmanuel Messori"
+email: teorems@gmail.com
+date: "23/07/2021"
+output:
+  html_document:
+  toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, cache = FALSE)
+```
+
+# Importation des librairies
+
+```{r dependencies, message=FALSE}
+library(readr)
+library(tidyverse)
+library(data.table)
+library(knitr)
+source("functions.R")
+```
+
+# Importation et preparation des données
+
+Nous utiliserons le fichier comprenant toutes les données sur les bilans alimentaires disponibles sur le site [FAO](http://www.fao.org/faostat/fr/#data/FBS), pour repérer les données qui concernent la viande de volaille (production, importation et exportation, disponibilité en kcal/jour par personne). Ensuite nous allons joindre des autre indicateurs toujours repérés sur le même site qui pourront fournir au final un cadre assez complet du profil économique des pays. 
+
+```{r data, message=FALSE, warning=FALSE, results='hide'}
+
+bilan_alim <- fread('FAO/BilansAlimentaires_F_Toutes_les_Données_(Normalisé).csv')
+
+#growth rate pop
+pop.growth <- bilan_alim[Produit == 'Population' & Élément == "Population totale", .(Produit, Année, Valeur, growth = (Valeur - shift(Valeur))/shift(Valeur)) ,by ="Zone"][Année == 2018]
+#remove grouped rows
+pop.growth <-pop.growth[1:174]
+#wide format
+pop.growth <-dcast(pop.growth, Zone ~ Produit, value.var = c("Valeur", "growth"))
+
+bilan_alim <- bilan_alim[Année==2018 & 
+             Produit %in% c("Viande", "Viande de Volailles", "Total General","Produits Vegetaux") &
+           Élément %in% c("Disponibilité alimentaire (Kcal/personne/jour)","Production", "Importations - Quantité", "Exportations - Quantité")]
+
+#remove grouped entities and columns
+bilan_alim <- bilan_alim[Zone %in% unique(Zone)[1:174]][, .(Zone, Produit, Élément,Valeur)]
+
+#wide format
+dcast(bilan_alim, Zone ~ Produit + Élément) -> bilan_alim
+
+
+#prix à la prod
+prix_prod <- read_csv("FAO/FAOSTAT_prix_prod_2018.csv")
+
+prix_prod %>% select(Zone, Élément, Produit,Valeur) %>% 
+  filter(Élément == "Indice des prix à la production (2014-2016 = 100)") %>% 
+  pivot_wider(names_from = c(Élément, Produit), values_from=Valeur) -> prix_prod
+
+	
+#sec alim
+
+sec_alim <- read_csv("FAO/FAOSTAT_sec_alim_2018.csv")
+
+sec_alim %>% 
+  mutate(Valeur = as.numeric(if_else(Valeur == '<2.5', '0', Valeur))) %>% 
+  select(Zone,Produit,Valeur) %>%  
+  pivot_wider(names_from = Produit, values_from = Valeur) -> sec_alim
+  
+#groupement des pays
+groupes <- read_csv("FAO/groupes_pays_7-19-2021.csv")
+groupes %>% distinct(`Groupe de pays`)
+
+#prix_conso
+prix_conso <- read_csv('FAO/prix_conso_7-19-2021.csv')
+distinct(prix_conso, Zone)
+prix_conso %>% filter(Année == 2020) %>% 
+  select(Zone, Produit, Mois, Valeur) %>% pivot_wider(names_from = Produit, values_from = Valeur) %>% 
+  group_by(Zone) %>% 
+  summarise(inflation_2020 = round(mean(`Food price inflation`),2), prix_conso_alim_2020 = round(mean(`Prix à la Consommation, Indices d'alimentation (2015 = 100)`),2)) %>% 
+  ungroup() -> prix_conso_2020
+
+#final joins
+
+merge(bilan_alim, pop.growth, all.x = TRUE) %>% 
+merge(., prix_prod, all.x = TRUE) %>% 
+merge(., sec_alim, all.x = TRUE) %>%
+merge(., prix_conso_2020, all.x = TRUE) %>% 
+column_to_rownames('Zone') -> countries.data
+
+#rename columns
+colnames(countries.data) = c('produits_vegetaux_dispo_alim','total_dispo_alim', 'viande_dispo_alim','viande_export', 'viande_import',
+                   'viande_prod','viande_volaille_dispo_alim', 'viande_volaille_export', 'viande_volaille_import',
+                   'viande_volaille_prod', 'population', 'population_croissance', 'prix_prod_index', 'pib_habitant',
+                   'taux_malnutrition', 'prop_import_export', 'stab_politique', 'inflation_2020', 'prix_conso_2020')
+
+#replace specific values
+pib.yemen <- 2300
+pib.nordcoree <- 1700
+pib.chine <- 15525.1
+prix.prod.venezuela <- 5227972.94
+
+#https://fr.wikipedia.org/wiki/CIA_World_Factbook  & FAO(donnée calculées)
+
+
+countries.data['Yémen',]['pib_habitant'] <- pib.yemen
+countries.data['République populaire démocratique de Corée',]['pib_habitant'] <- pib.nordcoree
+countries.data['Chine, continentale', 'pib_habitant'] <- pib.chine
+countries.data['Venezuela (République bolivarienne du)', 'prix_prod_index'] <- prix.prod.venezuela
+#la Chine comme entité est redondante (Chine continentale)
+countries.data <- countries.data[!row.names(countries.data) == 'Chine',]
+```
+
+## Imputation des données manquantes
+
+Présentation du dataframe ainsi obtenu:
+
+```{r}
+head(countries.data)
+```
+
+
+Le dataframe contient 173 et les 19 variables suivantes, comprenant les données 2018:
+
+1. `produits_vegetaux_dispo_alim` : total en kcal/personne/jour.
+2. `total_dispo_alim`: total de la disponibilité alimentaire en kcal/personne/jour.
+3. `viande_dispo_alim` : total de la disponibilité alimentaire de viande en kcal/personne/jour.
+4. `viande_export`: total des exportation de viande en milliers de tonnes.
+5. `viande_import` : total des importation de viande en milliers de tonnes.
+6. `viande_prod` : total de la production de viande en milliers de tonnes.
+7. `viande_volaille_dispo_alim`: total de la disponibilité alimentaire en kcal/personne/jour.
+8. `viande_volaille_export`: total exports de viande de volaille
+9. `viande_volaille_import`: total des importations de viande de volaille
+10.`viande_volaille_prod `: total de la productions de viande de volaille
+11. `population` : en milliers de personnes.
+12. `population_croissance` : taux de croissance 2017-2018
+13. `prix_prod_index`: index du prix à la production(viande de volaille)
+14. `pib_habitant`: pib habitant en $
+15  `taux_malnutrition`: prévalence de la sous alimentation
+16. `prop_import_export`: rapport entre importations et exportations totales
+17. `stab_politique`: indice de stabilité politique
+18. `inflation_2020`: indice d'inflation des prix des produits alimentaires (données 2020)
+19. `prix_conso_2020`: indice des prix à la consommation (données 2020)
+
+```{r intro}
+library(DataExplorer)
+introduce(countries.data)
+plot_str(countries.data)
+plot_intro(countries.data)
+plot_missing(countries.data)
+```
+
+Avant d'effectuer notre analyse on ira imputer les données manquantes avec une méthode basé sur l'analyse des composantes principales:
+
+```{r imputation, message=FALSE, warning=FALSE, results='hide'}
+library(missMDA)
+
+#imputation des valeurs manquantes
+#estimation du nombre de composantes nécessaires à l'imputation
+estim_ncpPCA(countries.data,scale = FALSE)
+#on retient 5 composantes et on ne réduit pas les variables
+res.comp <- imputePCA(countries.data, ncp=5, nb.init = 10, scale = FALSE)
+data <- as.data.frame(res.comp$completeObs)
+
+#on va attribuer 0 aux valeurs imputées négatives dans des colonnes spécifiques
+data<- data %>% 
+  mutate(across(viande_export:viande_volaille_prod, ~ replace(., .<0, 0))) %>% 
+  mutate(viande_export = if_else(viande_export > viande_import + viande_prod, 0, viande_export)) %>% 
+  mutate(viande_volaille_export = if_else(viande_volaille_export > viande_volaille_import + viande_volaille_prod, 0, viande_volaille_export))
+
+#quick check
+which(data<0, arr.ind = TRUE)
+```
+
+
+## Premiere analyse des variables
+
+On peut maintenant analyser les distributions de variables ainsi que la matrice des corrélations.
+
+
+```{r dist}
+plot_histogram(data)
+```
+
+On remarque on particulier la skewness très accentué des distributions des variables qui concernent la viande (les distributions sont toutes aplaties à droite ), en particulier pour la production, l'importation et l'exportation. On est en effet en présence de plusieurs outliers qui présentent des valeurs beaucoup plus elevé de la moyenne.
+
+```{r}
+summary(data$viande_prod)
+```
+
+Si on prend par exemple la production de viande, on remarque que la plupart de pays produisent moins de 1051 milliers de tonnes, mais qu'il existe un petit nombre de pays qu'il produit beaucoup plus.
+
+```{r}
+
+arrange(data, desc(viande_volaille_prod)) %>% select(viande_volaille_prod) %>% slice_head(n=10) 
+```
+
+Etats-Unis, Chine et Brésil ont chacun une production au moins trois fois supérieure que le pays classé en quatrième place, la Russie.
+
+```{r cor, fig.width=11}
+plot_correlation(data, theme_config = list(legend.position = "bottom", axis.text.x = element_text(angle = 90),panel.background = element_blank()))
+```
+
+On retiendra les corrélations le plus intéressantes:
+
+* entre taux de malnutrition et le total de disponibilité alimentaire par jour (-0.81)
+* entre population et production de viande (0.73)
+* entre pib habitant et la disponibilité alimentaire de viande (0.67)
+
+# Clustering
+
+## CAH et Kmeans sur le dataset complet
+
+### CAH
+
+```{r cah full data}
+#clustering
+library(FactoMineR)
+library(FactoInvestigate)
+library(factoextra)
+library(cluster)
+library(gridExtra)
+
+#scale the data
+data.matrix <- scale(as.matrix(data))
+
+#determine clusterability of the dataset (Hopkins statistic)
+get_clust_tendency(data.matrix, n= nrow(data.matrix) - 1)
+
+#CLUSTERING HIERARCHIQUE
+#On peut observer les effets des choix de différents linkages.
+#ward.D, ward.D2 et complete semblent fournir les groupes plus équilibres
+#plot_dendrograms(data.matrix)
+
+grid.arrange(
+fviz_nbclust(data.matrix, FUNcluster = hcut, method = "wss"),
+fviz_nbclust(data.matrix, FUNcluster = hcut, method = "silhouette"),
+fviz_nbclust(data.matrix, FUNcluster = hcut, method = "gap_stat"),
+ncol = 2)
+```
+
+
+```{r dendro, fig.width=12}
+#on choisi 4 groupes
+data.hclust <- hcut(data.matrix, 4, method = "ward.D")
+
+fviz_dend(data.hclust, cex = 0.5)
+```
+
+### KMeans
+
+```{r kmeans, warning=FALSE}
+##kMEANS
+#nombre de centres optimal pour le kmeans
+
+  grid.arrange(
+fviz_nbclust(data.matrix, FUNcluster = kmeans, method = "wss"),
+fviz_nbclust(data.matrix, FUNcluster = kmeans, method = "silhouette"),nrow=1 )
+
+# le "coude" confirme que 4 groupe préservent l'information semblerait le nombre optimal
+data.km <- kmeans(data.matrix, centers = 4, nstart=50)
+
+#on visualise les clusters ainsi obtenus (projetés sur le 1er plan factoriel)
+
+fviz_cluster(data.hclust, main = 'Hclust 4, all countries', repel = TRUE)
+fviz_cluster(data.km, data = data, main = "Kmeans 4, all countries", repel = TRUE)
+
+# on examine les centroids
+
+as.data.frame(aggregate(data, by=list(cluster=data.hclust$cluster), mean))
+as.data.frame(aggregate(data, by=list(cluster=data.km$cluster), mean))
+
+table(data.hclust$cluster, data.km$cluster)
+
+```
+
+4 groupes ont été identifiés :
+
+1. Groupe de plus **forts producteurs** mondiaux, populations massives.
+
+2. **Pays "pauvres"** (`pib_habitant` moyen le plus bas), prix à la conso le plus élevé.
+
+3. Cluster constitué uniquement du **Venezuela**. En effet en 2020 ce pays a été confronté à une forte crise inflationnaire, ce qui le place "très loin" des autre pays.
+
+4. **Pays riches**, producteur et importateur de viande.
+
+Les groupes de pays Brésil,USA & Chine a été isolé de façon identique par les deux algorithmes. Les deux autres groupes sont très similaires, le Kmeans faisant une distinction plus nette entre le deux.
+
+
+# Analyse des composantes principales
+
+## ACP sur le dataset complet
+
+```{r acp}
+res.pca <- PCA(data, ncp=5, graph=FALSE)
+
+#valeurs propres
+#le premiers 5 dimensions sont suffisantes a retenir 77% de la variabilité.
+get_eig(res.pca)
+fviz_eig(res.pca)
+
+dimdesc(res.pca, 1:5)[1:5]
+
+#contribution des variables aux axes
+fviz_pca_contrib(res.pca, choice = "var", axes=1)
+fviz_pca_contrib(res.pca, choice = "var", axes=2)
+
+fviz_pca_biplot(res.pca, repel = TRUE,  select.var= list(cos2 = 0.5))
+
+
+```
+
+Les variables qui mieux nous permettent de mieux interpréter les axes sont `total_dispo_alim` pour la première dimension et `viande_prod` pour la deuxième. Le deuxième plan est caractérise principalement par `prix_prod` et `produits_vegetaux_dispo_alim`. 
+
+On peut maintenant appliquer un CAH sur les composantes principales.
+
+```{r acp clust}
+#clustering de l'acp
+res.clust <- classif(res.pca)
+table(res.clust$data.clust$clust, data.hclust$cluster)
+```
+
+Les résultats sont très similaires au CAH appliqué précédemment:
+
+ 1. Venezuela(crise inflationnaire), (forts valeurs pour les variables `prix_conso_2020`, `prix_prod_index` and `inflation_2020`)
+ 2. Pays pauvres (forts valeurs pour les variables *population_croissance* and *taux_malnutrition*)
+ 3. Pays développés, 
+ 4. Forts Producteurs
+
+Le groupe 3 c'est ce qu'il nous intéresse car il contient des pays de profil similaires à la France, entre lesquels on pourra sélectionner des candidats potentiels.
+
+
+```{r map full}
+source("map.r")
+plot_map(data, res.clust$data.clust$clust)
+```
+
+## ACP sur le groupe 3
+
+On va maintenant se concentrer sur le cluster 3, qui contient les pays plus intéressants sous un profil économique.
+
+```{r acp cand}
+g3 <- filter(res.clust$data.clust, clust == 3) %>% select(-clust)
+
+#on va effectuer encore une PCA sur ce groupe
+res.pca.g3 <- PCA(g3, ncp = 5)
+
+#4 dimension retiennent 64.11% de l'inertie
+fviz_eig(res.pca.g3)
+
+fviz_pca_biplot(res.pca.g3, col.ind = g3$viande_volaille_import, gradient.cols ="OrRd", title = "PCA candidats, importations")
+
+```
+
+## Clustering du groupe 3
+
+```{r acp clust cand,fig.width=11}
+res.clust.g3 <- classif(res.pca.g3, graph = FALSE)
+
+fviz_cluster(res.clust.g3)
+```
+
+Nous avons trois clusters résultants:
+
+**Cluster 1**
+Pays de petit taille, isles, pas très riches mais avec un bon niveau de vie, qui ont déjà une très bonne disponibilité alimentaire de viande de volaille (**Trinité-et-Tobago**, **Barbade**, **Dominique**, **Jamaïque** **Saint-Kitts-et-Nevis**, etc. )
+- forts valeur pour les variables *viande_volaille_dispo_alim*, *prop_import_export*, *taux_malnutrition*, *prix_prod_index* et *prix_conso_2020* (en ordre décroissant).
+- faibles valeurs pour les variables *total_dispo_alim*, *produits_vegetaux_dispo_alim*, *pib_habitant*, *viande_prod*, *viande_import*, *population*, *viande_volaille_prod*, *viande_volaille_import* and *viande_export* (en ordre croissant).
+
+**Cluster 2**
+Pays avec populations de petite taille, avec le mêmé taux import-export du groupe 3, prix de production relativement plus haut(pourront être considéré comme marché potentiel) (**Chypre**, **Estonie**,**Tchéquie**, **Slovénie**, ***Malte**,etc. )
+- forts valeurs pour les variables *stab_politique*, *pib_habitant* and *total_dispo_alim* (ordre décroissant).
+- faible valeurs pour *viande_prod*, *viande_volaille_prod*, *population*, *viande_volaille_dispo_alim*, *viande_import*, *taux_malnutrition*, *viande_volaille_import*, *viande_volaille_export*, *viande_export* et *prop_import_export* (ordre croissant).
+
+**Cluster 3**
+Pays producteurs, qui importent aussi (**France**,**Italie**, **Espagne**, **République de Corée(Sud)**,**Canada** )
+- forts valeurs pour les variables *viande_prod*, *population*, *viande_volaille_prod*, *viande_import*, *viande_volaille_import*, *viande_export*, *viande_volaille_export*, *produits_vegetaux_dispo_alim* et *total_dispo_alim* (ordre décroissant).
+- faible valeurs pour *stab_politique*, *prop_import_export* and *prix_prod_index* (ordre croissant).
+
+## Visualisation des variables et des individus des trois groupes
+
+```{r acp heat var}
+variables <- aggregate(res.clust.g3$data.clust[-(ncol(res.clust.g3$data.clust))], list(cluster =res.clust.g3$data.clust$clust), FUN = mean)
+
+#drop first row
+var.heat <- scale(variables[-1]) %>% cbind(variables[1]) %>% melt()
+
+#heatmap des variables
+ggplot(var.heat, aes(variable, cluster)) + 
+         geom_tile(aes(fill=value)) + 
+         coord_flip() + 
+         scale_fill_gradient2() + 
+         geom_text(data = melt(variables), aes(label = round(value,2)))+
+         theme_classic()
+```
+
+
+```{r acp heat ind,  fig.dim=c(15,15)}
+#heatmaps des variables et des individus en comparaison au clustering
+heatmap(scale(g3), hclustfun=function(x) hclust(x,method="ward.D"), RowSideColors = as.character(res.clust.g3$data.clust$clus))
+mytitle = "Heatmap des variables et des individus"
+mysubtitle = "Comparaison du CAH avec le clustering effectueé sur l'ACP"
+mtext(side=3, line=3, at=-0.07, adj=0, cex=1, mytitle)
+mtext(side=3, line=2, at=-0.07, adj=0, cex=0.7, mysubtitle)
+```
+
+On peut aussi visualiser les clusters obtenus sur une carte:
+
+```{r map cand}
+plot_map(g3, res.clust.g3$data.clust$clust)
+```
+
+---------------------------
+
+## DBSCAN
+
+```{r dbscan cand}
+library(reticulate)
+
+####DBSCAN
+#Candidats potentiels, nouveau marchés
+
+#on va retenir les clusters 2 et 3 pour effecteur un dbscan sur le premieres deux
+#composantes principales
+
+candidates <- res.clust.g3$call$X
+
+py_run_file("dbscan.py")
+
+#mis à part Barbade, tous le pays retenus au final font partie du cluster 2
+```
+
+
+```{r dbscan cand res}
+data %>% rownames_to_column('pays') %>% inner_join(py$filtered, by = c("pays"="index")) %>% mutate(pays=pays, indicateur = viande_volaille_import/viande_volaille_prod * pib_habitant / (prix_conso_2020 * prix_prod_index) * population, .keep="used") %>% arrange(desc(indicateur)) %>% head(10)
+```
+
+```{r dbscan full}
+#On peut aussi essayer sur le dataframe complet
+full <- res.clust$call$X
+
+py_run_file("dbscan_fulldf.py")
+
+```
+
+L'algorithme individue 23 clusters, dont celui qui comprend la France compte Angleterre et Pologne.
+
+```{r dbscan full res}
+data %>% rownames_to_column('pays') %>% inner_join(py$df_db_full) %>% select(pays, label) %>%  arrange(desc(label)) %>% head(10)
+```
+
+***
+
+# Recommendations
+
+Sur la base des méthodes de clustering utilisées, on peut identifier deux groupes finales de clients :
+
+1. Pays à cibler **en premier lieu** pour l'exportation:
+
+```{r}
+res.clust.g3$data.clust %>% rownames_to_column('Pays') %>% filter(clust == 3 & Pays != "France") %>% mutate(Pays = Pays, indicateur= viande_volaille_import/viande_volaille_prod * pib_habitant * population, .keep="used") %>% arrange(desc(indicateur)) %>% head(10) %>% kable(title="Candidats primaires")
+```
+
+2. **Marchés émergents**, potentiellement intéressants:
+
+```{r}
+res.clust.g3$data.clust %>% filter(clust == 2) %>% rownames_to_column("Pays") %>% mutate(Pays = Pays, indicateur = viande_volaille_import/(viande_volaille_prod * prix_conso_2020) * population * pib_habitant, .keep="used") %>% arrange(desc(indicateur)) %>%  head(10) %>% kable(title="Candidats potentiels")
+```
+
+Le DBSCAN identifie aussi les pays le plus proches à la France en terme de profil général : Pologne et Royaume. Uni.
