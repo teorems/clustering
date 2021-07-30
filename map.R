@@ -7,7 +7,7 @@ library(ggplot2)
 library(dplyr)
 
 world_map <- map_data("world")
-groupes <- read.csv("FAO/groupes_pays_7-19-2021.csv", encoding = 'UTF-8')
+groupes <- read.csv("groupes_pays.csv", encoding = 'UTF-8')
 monde <- groupes[groupes$Groupe.de.pays == 'Monde',]
 
 data %>% mutate(Pays = rownames(data)) %>% 

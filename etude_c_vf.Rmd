@@ -23,101 +23,19 @@ library(knitr)
 source("functions.R")
 ```
 
-# Importation et preparation des données
+# Presentation des données
 
-Nous utiliserons le fichier comprenant toutes les données sur les bilans alimentaires disponibles sur le site [FAO](http://www.fao.org/faostat/fr/#data/FBS), pour repérer les données qui concernent la viande de volaille (production, importation et exportation, disponibilité en kcal/jour par personne). Ensuite nous allons joindre des autre indicateurs toujours repérés sur le même site qui pourront fournir au final un cadre assez complet du profil économique des pays. 
+Nous utiliserons le fichier comprenant toutes les données sur les bilans alimentaires disponibles sur le site [FAO](http://www.fao.org/faostat/fr/#data/FBS), pour repérer les données qui concernent la viande de volaille (production, importation et exportation, disponibilité en kcal/jour par personne). Ensuite nous allons joindre d' autres indicateurs toujours repérés sur le même site qui pourront fournir au final un cadre assez complet du profil économique des pays. 
 
-```{r data, message=FALSE, warning=FALSE, results='hide'}
-
-bilan_alim <- fread('FAO/BilansAlimentaires_F_Toutes_les_Données_(Normalisé).csv')
-
-#growth rate pop
-pop.growth <- bilan_alim[Produit == 'Population' & Élément == "Population totale", .(Produit, Année, Valeur, growth = (Valeur - shift(Valeur))/shift(Valeur)) ,by ="Zone"][Année == 2018]
-#remove grouped rows
-pop.growth <-pop.growth[1:174]
-#wide format
-pop.growth <-dcast(pop.growth, Zone ~ Produit, value.var = c("Valeur", "growth"))
-
-bilan_alim <- bilan_alim[Année==2018 & 
-             Produit %in% c("Viande", "Viande de Volailles", "Total General","Produits Vegetaux") &
-           Élément %in% c("Disponibilité alimentaire (Kcal/personne/jour)","Production", "Importations - Quantité", "Exportations - Quantité")]
-
-#remove grouped entities and columns
-bilan_alim <- bilan_alim[Zone %in% unique(Zone)[1:174]][, .(Zone, Produit, Élément,Valeur)]
-
-#wide format
-dcast(bilan_alim, Zone ~ Produit + Élément) -> bilan_alim
-
-
-#prix à la prod
-prix_prod <- read_csv("FAO/FAOSTAT_prix_prod_2018.csv")
-
-prix_prod %>% select(Zone, Élément, Produit,Valeur) %>% 
-  filter(Élément == "Indice des prix à la production (2014-2016 = 100)") %>% 
-  pivot_wider(names_from = c(Élément, Produit), values_from=Valeur) -> prix_prod
-
-	
-#sec alim
-
-sec_alim <- read_csv("FAO/FAOSTAT_sec_alim_2018.csv")
-
-sec_alim %>% 
-  mutate(Valeur = as.numeric(if_else(Valeur == '<2.5', '0', Valeur))) %>% 
-  select(Zone,Produit,Valeur) %>%  
-  pivot_wider(names_from = Produit, values_from = Valeur) -> sec_alim
-  
-#groupement des pays
-groupes <- read_csv("FAO/groupes_pays_7-19-2021.csv")
-groupes %>% distinct(`Groupe de pays`)
-
-#prix_conso
-prix_conso <- read_csv('FAO/prix_conso_7-19-2021.csv')
-distinct(prix_conso, Zone)
-prix_conso %>% filter(Année == 2020) %>% 
-  select(Zone, Produit, Mois, Valeur) %>% pivot_wider(names_from = Produit, values_from = Valeur) %>% 
-  group_by(Zone) %>% 
-  summarise(inflation_2020 = round(mean(`Food price inflation`),2), prix_conso_alim_2020 = round(mean(`Prix à la Consommation, Indices d'alimentation (2015 = 100)`),2)) %>% 
-  ungroup() -> prix_conso_2020
-
-#final joins
-
-merge(bilan_alim, pop.growth, all.x = TRUE) %>% 
-merge(., prix_prod, all.x = TRUE) %>% 
-merge(., sec_alim, all.x = TRUE) %>%
-merge(., prix_conso_2020, all.x = TRUE) %>% 
-column_to_rownames('Zone') -> countries.data
-
-#rename columns
-colnames(countries.data) = c('produits_vegetaux_dispo_alim','total_dispo_alim', 'viande_dispo_alim','viande_export', 'viande_import',
-                   'viande_prod','viande_volaille_dispo_alim', 'viande_volaille_export', 'viande_volaille_import',
-                   'viande_volaille_prod', 'population', 'population_croissance', 'prix_prod_index', 'pib_habitant',
-                   'taux_malnutrition', 'prop_import_export', 'stab_politique', 'inflation_2020', 'prix_conso_2020')
-
-#replace specific values
-pib.yemen <- 2300
-pib.nordcoree <- 1700
-pib.chine <- 15525.1
-prix.prod.venezuela <- 5227972.94
-
-#https://fr.wikipedia.org/wiki/CIA_World_Factbook  & FAO(donnée calculées)
-
-
-countries.data['Yémen',]['pib_habitant'] <- pib.yemen
-countries.data['République populaire démocratique de Corée',]['pib_habitant'] <- pib.nordcoree
-countries.data['Chine, continentale', 'pib_habitant'] <- pib.chine
-countries.data['Venezuela (République bolivarienne du)', 'prix_prod_index'] <- prix.prod.venezuela
-#la Chine comme entité est redondante (Chine continentale)
-countries.data <- countries.data[!row.names(countries.data) == 'Chine',]
-```
 
 ## Imputation des données manquantes
 
 Présentation du dataframe ainsi obtenu:
 
 ```{r}
-head(countries.data)
-```
+glimpse(countries.data)
 
+```
 
 Le dataframe contient 173 et les 19 variables suivantes, comprenant les données 2018:
 
@@ -330,7 +248,7 @@ Le groupe 3 c'est ce qu'il nous intéresse car il contient des pays de profil si
 
 
 ```{r map full}
-source("map.r")
+source("map.R")
 plot_map(data, res.clust$data.clust$clust)
 ```
 
@@ -457,13 +375,13 @@ Sur la base des méthodes de clustering utilisées, on peut identifier deux grou
 1. Pays à cibler **en premier lieu** pour l'exportation:
 
 ```{r}
-res.clust.g3$data.clust %>% rownames_to_column('Pays') %>% filter(clust == 3 & Pays != "France") %>% mutate(Pays = Pays, indicateur= viande_volaille_import/viande_volaille_prod * pib_habitant * population, .keep="used") %>% arrange(desc(indicateur)) %>% head(10) %>% kable(title="Candidats primaires")
+res.clust.g3$data.clust %>% rownames_to_column('Pays') %>% filter(clust == 3 & Pays != "France") %>% mutate(Pays = Pays, indicateur= viande_volaille_import/viande_volaille_prod * pib_habitant * population, .keep="used") %>% arrange(desc(indicateur)) %>% head(10) %>% kable(caption="Candidats primaires")
 ```
 
 2. **Marchés émergents**, potentiellement intéressants:
 
 ```{r}
-res.clust.g3$data.clust %>% filter(clust == 2) %>% rownames_to_column("Pays") %>% mutate(Pays = Pays, indicateur = viande_volaille_import/(viande_volaille_prod * prix_conso_2020) * population * pib_habitant, .keep="used") %>% arrange(desc(indicateur)) %>%  head(10) %>% kable(title="Candidats potentiels")
+res.clust.g3$data.clust %>% filter(clust == 2) %>% rownames_to_column("Pays") %>% mutate(Pays = Pays, indicateur = viande_volaille_import/(viande_volaille_prod * prix_conso_2020) * population * pib_habitant, .keep="used") %>% arrange(desc(indicateur)) %>%  head(10) %>% kable(caption="Candidats potentiels")
 ```
 
 Le DBSCAN identifie aussi les pays le plus proches à la France en terme de profil général : Pologne et Royaume. Uni.
