@@ -1,3 +1,3 @@
 # La poule qui chante, étude de clustering
 
-Customer segmentation through PCA, Hierarchical Clustering, Kmeans.  
+Customer segmentation through PCA, Hierarchical Clustering, Kmeans R) and DBSCAN (Python).
